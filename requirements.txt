@@ -1,0 +1,4 @@
+cupy>=13.2.0
+numpy>=1.26.4
+pygame==2.6.0
+python>=3.11
