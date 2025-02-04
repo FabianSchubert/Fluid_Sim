@@ -3,10 +3,6 @@ import pygame as pg
 
 from simulator import Simulator
 
-import cProfile, pstats, io
-from pstats import SortKey
-
-
 WIDTH, HEIGHT = 500, 500
 
 SCR_WIDTH, SCR_HEIGHT = 1500, 1500
@@ -136,12 +132,3 @@ while running:
 
 
 pg.quit()
-"""
-pr.disable()
-s = io.StringIO()
-print(dir(SortKey))
-sortby = SortKey.CUMULATIVE
-ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-ps.print_stats()
-print(s.getvalue())
-"""

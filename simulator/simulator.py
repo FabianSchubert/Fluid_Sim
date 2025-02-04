@@ -1,6 +1,5 @@
 import numpy as np
 import cupy as cp
-from numba import jit
 
 from enum import Enum
 
