@@ -8,7 +8,7 @@ Use `pip install -r requirements.txt` to install the necessary packages. **Note*
 
 Drag the fluid with your mouse:
 
-![alt text](fluid_sim.gif "Fluid Simulation Example")
+![alt text](fluid_sim_small.gif "Fluid Simulation Example")
 
 You can change parameters such as the simulation and window resolution in the `main.py` file. You can also experiment with different simulation parameters by providing a dictionary via the `sim_params` keyword argument to the constructor of the `sim` object in `main.py` (see `DEFAULT_PARAMS` in `/simulator/simulator.py` for an example).
 
