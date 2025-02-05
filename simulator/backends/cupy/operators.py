@@ -1,5 +1,4 @@
 import cupy as xp
-from numba import cuda
 
 BLOCK_SIZE_X, BLOCK_SIZE_Y = 8, 8
 
@@ -27,7 +26,7 @@ void incompr_it(
     const float _mask_inv = 1.0 - _mask;
 
     u[idx_00] += (_mask_inv * div[idx_0n] * inv_sum_mask[idx_0n] - _mask * div[idx_00] * inv_sum_mask[idx_00]) * _g;
-    v[idx_00] += (_mask_inv * div[idx_n0] * inv_sum_mask[idx_0n] - _mask * div[idx_00] * inv_sum_mask[idx_00]) * _g;
+    v[idx_00] += (_mask_inv * div[idx_n0] * inv_sum_mask[idx_n0] - _mask * div[idx_00] * inv_sum_mask[idx_00]) * _g;
 
     u[idx_00] *= mask_u[idx_00];
     v[idx_00] *= mask_v[idx_00];

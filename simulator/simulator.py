@@ -23,11 +23,12 @@ else:
 BACKEND = Enum("Backend", {"CPU": np, "GPU": (cp if CUDA_GPU_AVAILABLE else None)})
 
 DEFAULT_PARAMS = {
-    "dt": 0.3,
+    "dt": 0.5,
     "gs_it": 20,
     "gs_overrelax": 1.95,
     "visc": 0.0,
     "n_part": 5000,
+    "n_substances": 1,
 }
 
 
@@ -40,6 +41,7 @@ class Simulator:
         backend: str = "GPU",
     ) -> None:
         assert len(dimensions) == 2, "dimensions parameter expects length 2 tuple."
+        self.size = dimensions
         self.WIDTH = dimensions[0]
         self.HEIGHT = dimensions[1]
 
@@ -66,6 +68,25 @@ class Simulator:
             self.visc_step = numpy_ops.visc_step
             self.bil_filt = numpy_ops.bil_filt
 
+        if self.backend == BACKEND.CPU:
+
+            def to_host(x):
+                return x.copy()
+
+            def to_device(x):
+                return x.copy()
+
+        else:
+
+            def to_host(x):
+                return self.xp.asnumpy(x)
+
+            def to_device(x):
+                return self.xp.asarray(x)
+
+        self.to_host = to_host
+        self.to_device = to_device
+
         self.SIM_PARAMS = DEFAULT_PARAMS | (
             sim_params if isinstance(sim_params, dict) else {}
         )
@@ -79,6 +100,7 @@ class Simulator:
         self.GS_OVERRELAX = self.prec(self.SIM_PARAMS["gs_overrelax"])
         self.VISC = self.prec(self.SIM_PARAMS["visc"])
         self.N_PART = int(self.SIM_PARAMS["n_part"])
+        self.N_SUBST = int(self.SIM_PARAMS["n_substances"])
 
         self.X, self.Y = self.xp.meshgrid(
             self.xp.arange(self.WIDTH), self.xp.arange(self.HEIGHT)
@@ -99,6 +121,13 @@ class Simulator:
         self.vu = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
         self.D = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
+
+        self.f_ext_u = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
+        self.f_ext_v = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
+
+        self.rho = self.xp.zeros(
+            (self.N_SUBST, self.HEIGHT, self.WIDTH), dtype=self.prec
+        )
 
         # only needed for cpu backend
         self.chb_mask = self.xp.zeros((2, self.HEIGHT, self.WIDTH), dtype=self.prec)
@@ -155,9 +184,19 @@ class Simulator:
             self.HEIGHT,
         )
 
+        self.xp.multiply(self._u[i_n], self.mask_u, out=self._u[i_n])
+        self.xp.multiply(self._v[i_n], self.mask_v, out=self._v[i_n])
+
         self.visc_step(self._u[i_n], self.ul, self._u[i_n], self.DT, self.VISC)
         self.visc_step(self._v[i_n], self.vl, self._v[i_n], self.DT, self.VISC)
 
+        self.xp.add(self._u[i_n], self.DT * self.f_ext_u, out=self._u[i_n])
+        self.xp.add(self._v[i_n], self.DT * self.f_ext_v, out=self._v[i_n])
+
+        self.f_ext_u[:] = 0.0
+        self.f_ext_v[:] = 0.0
+
+        #'''
         self.solve_incompr(
             self._u[i_n],
             self._v[i_n],
@@ -171,12 +210,43 @@ class Simulator:
             self.WIDTH,
             self.HEIGHT,
         )
+        #'''
 
         self.calc_vel_center(self._u[i_n], self._v[i_n], self.uc, self.vc)
+
+        for i in range(self.N_SUBST):
+            self.semi_lag_step(
+                self.rho[i],
+                self._u[i_n],
+                self._v[i_n],
+                self.rho[i],
+                self.X,
+                self.Y,
+                self.DT,
+                self.WIDTH,
+                self.HEIGHT,
+            )
 
         self.update_particles(self._u[i_n], self._v[i_n])
 
         self.flop = 1 - self.flop
+
+    def add_force(self, x, y, fx, fy, mode="accumulate"):
+        assert mode in ["accumulate", "direct"]
+        if mode == "accumulate":
+            self.f_ext_u[y, x] += fx
+            self.f_ext_v[y, x] += fy
+        else:
+            self._u[self.flop, y, x] += fx * self.DT
+            self._v[self.flop, y, x] += fy * self.DT
+
+    def add_obstacle(self, x, y):
+        self.solid_mask[y % self.HEIGHT, x % self.WIDTH] = 1.0
+        self.update_masks()
+
+    def add_rho(self, ind, x, y, rho):
+        if ind < self.N_SUBST:
+            self.rho[ind, y, x] += rho
 
     def update_particles(self, u, v):
         self.bil_filt(
@@ -230,25 +300,6 @@ class Simulator:
         ).astype(self.prec)
 
         self.inv_sum_mask[_nb_sum == 0] = 0.0
-
-        if self.backend == BACKEND.CPU:
-
-            def to_host(x):
-                return x.copy()
-
-            def to_device(x):
-                return x.copy()
-
-        else:
-
-            def to_host(x):
-                return self.xp.asnumpy(x)
-
-            def to_device(x):
-                return self.xp.asarray(x)
-
-        self.to_host = to_host
-        self.to_device = to_device
 
     @property
     def u(self):
