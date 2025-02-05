@@ -1,15 +1,31 @@
-import numpy as np
-import cupy as cp
+from importlib.util import find_spec
 
 from enum import Enum
 
-BACKEND = Enum("Backend", {"CPU": np, "GPU": cp})
+import numpy as np
 
-PREC = Enum("Prec", ["f64", "f32", "f16"])
+from .backends.numpy import operators as numpy_ops
+
+CUPY_INSTALLED = find_spec("cupy") is not None
+if CUPY_INSTALLED:
+    import cupy as cp
+
+    CUDA_GPU_AVAILABLE = cp.is_available()
+else:
+    CUDA_GPU_AVAILABLE = False
+
+if CUDA_GPU_AVAILABLE:
+    from .backends.cupy import operators as cupy_ops
+else:
+    print("Cupy not installed or no CUDA GPU available. Falling back to CPU.")
+
+
+BACKEND = Enum("Backend", {"CPU": np, "GPU": (cp if CUDA_GPU_AVAILABLE else None)})
 
 DEFAULT_PARAMS = {
     "dt": 0.3,
     "gs_it": 20,
+    "gs_overrelax": 1.95,
     "visc": 0.0,
     "n_part": 5000,
 }
@@ -21,16 +37,34 @@ class Simulator:
         self,
         dimensions: tuple[int, int],
         sim_params: dict | None = None,
-        backend: str = "CPU",
-        precision: str = "f32",
+        backend: str = "GPU",
     ) -> None:
         assert len(dimensions) == 2, "dimensions parameter expects length 2 tuple."
         self.WIDTH = dimensions[0]
         self.HEIGHT = dimensions[1]
 
+        backend = backend if CUDA_GPU_AVAILABLE else "CPU"
+
         self.backend = BACKEND[backend]
 
-        self.prec = PREC[precision]
+        self.prec = self.xp.float32
+
+        if self.backend == BACKEND.GPU:
+            self.calc_uv = cupy_ops.calc_uv
+            self.calc_vu = cupy_ops.calc_vu
+            self.calc_vel_center = cupy_ops.calc_vel_center
+            self.semi_lag_step = cupy_ops.semi_lag_step
+            self.solve_incompr = cupy_ops.solve_incompr  # cupy_ops.solve_incompr
+            self.visc_step = cupy_ops.visc_step
+            self.bil_filt = cupy_ops.bil_filt
+        else:
+            self.calc_uv = numpy_ops.calc_uv
+            self.calc_vu = numpy_ops.calc_vu
+            self.calc_vel_center = numpy_ops.calc_vel_center
+            self.semi_lag_step = numpy_ops.semi_lag_step
+            self.solve_incompr = numpy_ops.solve_incompr
+            self.visc_step = numpy_ops.visc_step
+            self.bil_filt = numpy_ops.bil_filt
 
         self.SIM_PARAMS = DEFAULT_PARAMS | (
             sim_params if isinstance(sim_params, dict) else {}
@@ -40,52 +74,56 @@ class Simulator:
 
         assert len(_param_excl) == 0, f"Invalid sim. parameters {_param_excl}."
 
-        self.DT = self._prec(self.SIM_PARAMS["dt"])
+        self.DT = self.prec(self.SIM_PARAMS["dt"])
         self.GS_IT = int(self.SIM_PARAMS["gs_it"])
-        self.VISC = self._prec(self.SIM_PARAMS["visc"])
+        self.GS_OVERRELAX = self.prec(self.SIM_PARAMS["gs_overrelax"])
+        self.VISC = self.prec(self.SIM_PARAMS["visc"])
         self.N_PART = int(self.SIM_PARAMS["n_part"])
 
-        self.X, self.Y = self._num.meshgrid(
-            self._num.arange(self.WIDTH), self._num.arange(self.HEIGHT)
+        self.X, self.Y = self.xp.meshgrid(
+            self.xp.arange(self.WIDTH), self.xp.arange(self.HEIGHT)
         )
 
-        self._u = self._num.zeros((2, self.HEIGHT, self.WIDTH), dtype=self._prec)
-        self._v = self._num.zeros((2, self.HEIGHT, self.WIDTH), dtype=self._prec)
+        self._u = self.xp.zeros((2, self.HEIGHT, self.WIDTH), dtype=self.prec)
+        self._v = self.xp.zeros((2, self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.ul = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
-        self.vl = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
+        self.d = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.uc = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
-        self.vc = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
+        self.ul = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
+        self.vl = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.uv = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
-        self.vu = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
+        self.uc = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
+        self.vc = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.D = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
+        self.uv = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
+        self.vu = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.chb_mask = self._num.zeros((2, self.HEIGHT, self.WIDTH), dtype=self._prec)
-        self.chb_mask[0] = ((self.X + self.Y) % 2).astype(self._prec)
-        self.chb_mask[1] = ((self.X + self.Y + 1) % 2).astype(self._prec)
+        self.D = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.solid_mask = self._num.zeros((self.HEIGHT, self.WIDTH), dtype=self._prec)
+        # only needed for cpu backend
+        self.chb_mask = self.xp.zeros((2, self.HEIGHT, self.WIDTH), dtype=self.prec)
+        self.chb_mask[0] = ((self.X + self.Y) % 2).astype(self.prec)
+        self.chb_mask[1] = ((self.X + self.Y + 1) % 2).astype(self.prec)
 
-        self.mask_u, self.mask_v = self._num.ones(
-            (self.HEIGHT, self.WIDTH), dtype=self._prec
-        ), self._num.ones((self.HEIGHT, self.WIDTH), dtype=self._prec)
+        self.solid_mask = self.xp.zeros((self.HEIGHT, self.WIDTH), dtype=self.prec)
 
-        self.inv_sum_mask = 4.0 * self._num.ones(
-            (self.HEIGHT, self.WIDTH), dtype=self._prec
+        self.mask_u, self.mask_v = self.xp.ones(
+            (self.HEIGHT, self.WIDTH), dtype=self.prec
+        ), self.xp.ones((self.HEIGHT, self.WIDTH), dtype=self.prec)
+
+        self.inv_sum_mask = 4.0 * self.xp.ones(
+            (self.HEIGHT, self.WIDTH), dtype=self.prec
         )
 
         self.update_masks()
 
         self.flop = 0
 
-        self._pos_part = self._num.random.rand(self.N_PART, 2)
+        self._pos_part = self.xp.random.rand(self.N_PART, 2)
         self._pos_part[:, 0] *= self.WIDTH
         self._pos_part[:, 1] *= self.HEIGHT
-        self._u_part = self._num.zeros((self.N_PART))
-        self._v_part = self._num.zeros((self.N_PART))
+        self._u_part = self.xp.zeros((self.N_PART))
+        self._v_part = self.xp.zeros((self.N_PART))
 
     def step(self):
         i = self.flop
@@ -94,23 +132,69 @@ class Simulator:
         self.calc_uv(self._u[i], self.uv)
         self.calc_vu(self._v[i], self.vu)
 
-        self.semi_lag_step(self._u[i], self._u[i], self.vu, self._u[i_n])
-        self.semi_lag_step(self._v[i], self.uv, self._v[i], self._v[i_n])
+        self.semi_lag_step(
+            self._u[i],
+            self._u[i],
+            self.vu,
+            self._u[i_n],
+            self.X,
+            self.Y,
+            self.DT,
+            self.WIDTH,
+            self.HEIGHT,
+        )
+        self.semi_lag_step(
+            self._v[i],
+            self.uv,
+            self._v[i],
+            self._v[i_n],
+            self.X,
+            self.Y,
+            self.DT,
+            self.WIDTH,
+            self.HEIGHT,
+        )
 
-        self.visc_step(self._u[i_n], self.ul, self._u[i_n])
-        self.visc_step(self._v[i_n], self.vl, self._v[i_n])
+        self.visc_step(self._u[i_n], self.ul, self._u[i_n], self.DT, self.VISC)
+        self.visc_step(self._v[i_n], self.vl, self._v[i_n], self.DT, self.VISC)
 
-        self.solve_incompr(self._u[i_n], self._v[i_n])
+        self.solve_incompr(
+            self._u[i_n],
+            self._v[i_n],
+            self.d,
+            self.mask_u,
+            self.mask_v,
+            self.inv_sum_mask,
+            # self.chb_mask,
+            self.GS_IT,
+            self.GS_OVERRELAX,
+            self.WIDTH,
+            self.HEIGHT,
+        )
 
-        self.calc_vel_center(self._u[i_n], self._v[i_n], self.uc, self.uv)
+        self.calc_vel_center(self._u[i_n], self._v[i_n], self.uc, self.vc)
 
         self.update_particles(self._u[i_n], self._v[i_n])
 
         self.flop = 1 - self.flop
 
     def update_particles(self, u, v):
-        self.bil_filt(u, self._pos_part[:, 0], self._pos_part[:, 1], self._u_part)
-        self.bil_filt(v, self._pos_part[:, 0], self._pos_part[:, 1], self._v_part)
+        self.bil_filt(
+            u,
+            self._pos_part[:, 0],
+            self._pos_part[:, 1],
+            self._u_part,
+            self.WIDTH,
+            self.HEIGHT,
+        )
+        self.bil_filt(
+            v,
+            self._pos_part[:, 0],
+            self._pos_part[:, 1],
+            self._v_part,
+            self.WIDTH,
+            self.HEIGHT,
+        )
 
         self._pos_part[:, 0] += self.DT * self._u_part
         self._pos_part[:, 1] += self.DT * self._v_part
@@ -122,28 +206,28 @@ class Simulator:
 
         self.mask_u = (
             1.0
-            - self._num.clip(
-                self.solid_mask + self._num.roll(self.solid_mask, 1, axis=1), 0.0, 1.0
+            - self.xp.clip(
+                self.solid_mask + self.xp.roll(self.solid_mask, 1, axis=1), 0.0, 1.0
             )
-        ).astype(self._prec)
+        ).astype(self.prec)
 
         self.mask_v = (
             1.0
-            - self._num.clip(
-                self.solid_mask + self._num.roll(self.solid_mask, 1, axis=0), 0.0, 1.0
+            - self.xp.clip(
+                self.solid_mask + self.xp.roll(self.solid_mask, 1, axis=0), 0.0, 1.0
             )
-        ).astype(self._prec)
+        ).astype(self.prec)
 
         _nb_sum = (
             self.mask_u
-            + self._num.roll(self.mask_u, -1, axis=1)
+            + self.xp.roll(self.mask_u, -1, axis=1)
             + self.mask_v
-            + self._num.roll(self.mask_v, -1, axis=0)
-        ).astype(self._prec)
+            + self.xp.roll(self.mask_v, -1, axis=0)
+        ).astype(self.prec)
 
-        self.inv_sum_mask = self._num.divide(
-            1.0, _nb_sum  # , out=self._num.zeros_like(_nb_sum), where=_nb_sum != 0
-        ).astype(self._prec)
+        self.inv_sum_mask = self.xp.divide(
+            1.0, _nb_sum  # , out=self.xp.zeros_like(_nb_sum), where=_nb_sum != 0
+        ).astype(self.prec)
 
         self.inv_sum_mask[_nb_sum == 0] = 0.0
 
@@ -158,10 +242,10 @@ class Simulator:
         else:
 
             def to_host(x):
-                return self._num.asnumpy(x)
+                return self.xp.asnumpy(x)
 
             def to_device(x):
-                return self._num.asarray(x)
+                return self.xp.asarray(x)
 
         self.to_host = to_host
         self.to_device = to_device
@@ -200,72 +284,55 @@ class Simulator:
 
     @property
     def backend(self):
-        return BACKEND["CPU"] if self._num is np else BACKEND["GPU"]
+        return BACKEND["CPU"] if self.xp is np else BACKEND["GPU"]
 
     @backend.setter
     def backend(self, be: BACKEND):
         assert isinstance(be, BACKEND)
-        self._num = be.value
+        self.xp = be.value
 
-    @property
-    def prec(self):
-        if self._prec == self._num.float64:
-            return PREC["f64"]
-        elif self._prec == self._num.float32:
-            return PREC["f32"]
-        return PREC["f16"]
-
-    @prec.setter
-    def prec(self, p: PREC):
-        assert isinstance(p, PREC)
-        if p == PREC.f64:
-            self._prec = self._num.float64
-        elif p == PREC.f32:
-            self._prec = self._num.float32
-        else:
-            self._prec = self._num.float16
-
+    """
     def solve_incompr(self, u, v):  # , mask_u, mask_v, inv_sum_mask):
 
         for i in range(self.GS_IT):
 
-            g = self._prec(1.95 if i < (self.GS_IT - 1) else 1.0)
+            g = self.prec(1.95 if i < (self.GS_IT - 1) else 1.0)
 
-            self._num.add(u, v, out=self.D)
-            self._num.subtract(self.D[:, :-1], u[:, 1:], out=self.D[:, :-1])
-            self._num.subtract(self.D[:-1, :], v[1:, :], out=self.D[:-1, :])
-            self._num.subtract(self.D[:, -1], u[:, 0], out=self.D[:, -1])
-            self._num.subtract(self.D[-1, :], v[0, :], out=self.D[-1, :])
+            self.xp.add(u, v, out=self.D)
+            self.xp.subtract(self.D[:, :-1], u[:, 1:], out=self.D[:, :-1])
+            self.xp.subtract(self.D[:-1, :], v[1:, :], out=self.D[:-1, :])
+            self.xp.subtract(self.D[:, -1], u[:, 0], out=self.D[:, -1])
+            self.xp.subtract(self.D[-1, :], v[0, :], out=self.D[-1, :])
 
-            self._num.multiply(self.D, self.inv_sum_mask, out=self.D)
-            self._num.multiply(self.D, self.chb_mask[i % 2], out=self.D)
-            self._num.multiply(self.D, g, out=self.D)
+            self.xp.multiply(self.D, self.inv_sum_mask, out=self.D)
+            self.xp.multiply(self.D, self.chb_mask[i % 2], out=self.D)
+            self.xp.multiply(self.D, g, out=self.D)
 
-            self._num.add(u[:, 1:], self.D[:, :-1], out=u[:, 1:])
-            self._num.add(u[:, 0], self.D[:, -1], out=u[:, 0])
+            self.xp.add(u[:, 1:], self.D[:, :-1], out=u[:, 1:])
+            self.xp.add(u[:, 0], self.D[:, -1], out=u[:, 0])
 
-            self._num.add(v[1:, :], self.D[:-1, :], out=v[1:, :])
-            self._num.add(v[0, :], self.D[-1, :], out=v[0, :])
+            self.xp.add(v[1:, :], self.D[:-1, :], out=v[1:, :])
+            self.xp.add(v[0, :], self.D[-1, :], out=v[0, :])
 
-            self._num.subtract(u, self.D, out=u)
-            self._num.subtract(v, self.D, out=v)
+            self.xp.subtract(u, self.D, out=u)
+            self.xp.subtract(v, self.D, out=v)
 
-            self._num.multiply(u, self.mask_u, out=u)
-            self._num.multiply(v, self.mask_v, out=v)
+            self.xp.multiply(u, self.mask_u, out=u)
+            self.xp.multiply(v, self.mask_v, out=v)
 
     def visc_step(self, f, f_l, f_n):
         self.lapl(f, f_l)
-        self._num.multiply(f_l, self.DT * self.VISC, out=f_l)
-        self._num.add(f, f_l, out=f_n)
+        self.xp.multiply(f_l, self.DT * self.VISC, out=f_l)
+        self.xp.add(f, f_l, out=f_n)
 
     def lapl(self, f, lp):
 
-        self._num.add(
-            self._num.roll(f, 1, axis=0), self._num.roll(f, -1, axis=0), out=lp
+        self.xp.add(
+            self.xp.roll(f, 1, axis=0), self.xp.roll(f, -1, axis=0), out=lp
         )
-        self._num.add(lp, self._num.roll(f, 1, axis=1), out=lp)
-        self._num.add(lp, self._num.roll(f, -1, axis=1), out=lp)
-        self._num.subtract(lp, 4.0 * f, out=lp)
+        self.xp.add(lp, self.xp.roll(f, 1, axis=1), out=lp)
+        self.xp.add(lp, self.xp.roll(f, -1, axis=1), out=lp)
+        self.xp.subtract(lp, 4.0 * f, out=lp)
 
     def bil_filt(self, f, x, y, f_n):
         x0 = x.astype(int)
@@ -291,44 +358,45 @@ class Simulator:
 
     def calc_vel_center(self, u, v, uc, vc):
 
-        self._num.add(u[:, :-1], u[:, 1:], out=uc[:, :-1])
-        self._num.add(u[:, -1], u[:, 0], out=uc[:, -1])
-        self._num.add(v[:-1, :], v[1:, :], out=vc[:-1, :])
-        self._num.add(v[-1, :], v[0, :], out=vc[-1, :])
+        self.xp.add(u[:, :-1], u[:, 1:], out=uc[:, :-1])
+        self.xp.add(u[:, -1], u[:, 0], out=uc[:, -1])
+        self.xp.add(v[:-1, :], v[1:, :], out=vc[:-1, :])
+        self.xp.add(v[-1, :], v[0, :], out=vc[-1, :])
 
-        self._num.multiply(uc, 0.5, out=uc)
-        self._num.multiply(vc, 0.5, out=vc)
+        self.xp.multiply(uc, 0.5, out=uc)
+        self.xp.multiply(vc, 0.5, out=vc)
 
     def calc_uv(self, u, uv):
-        self._num.add(u[1:, :-1], u[1:, 1:], out=uv[1:, :-1])
-        self._num.add(uv[1:, :-1], u[:-1, :-1], out=uv[1:, :-1])
-        self._num.add(uv[1:, :-1], u[:-1, 1:], out=uv[1:, :-1])
+        self.xp.add(u[1:, :-1], u[1:, 1:], out=uv[1:, :-1])
+        self.xp.add(uv[1:, :-1], u[:-1, :-1], out=uv[1:, :-1])
+        self.xp.add(uv[1:, :-1], u[:-1, 1:], out=uv[1:, :-1])
 
-        self._num.add(u[0, :-1], u[0, 1:], out=uv[0, :-1])
-        self._num.add(uv[0, :-1], u[-1, :-1], out=uv[0, :-1])
-        self._num.add(uv[0, :-1], u[-1, 1:], out=uv[0, :-1])
+        self.xp.add(u[0, :-1], u[0, 1:], out=uv[0, :-1])
+        self.xp.add(uv[0, :-1], u[-1, :-1], out=uv[0, :-1])
+        self.xp.add(uv[0, :-1], u[-1, 1:], out=uv[0, :-1])
 
-        self._num.add(u[1:, -1], u[1:, 0], out=uv[1:, -1])
-        self._num.add(uv[1:, -1], u[:-1, -1], out=uv[1:, -1])
-        self._num.add(uv[1:, -1], u[:-1, 0], out=uv[1:, -1])
+        self.xp.add(u[1:, -1], u[1:, 0], out=uv[1:, -1])
+        self.xp.add(uv[1:, -1], u[:-1, -1], out=uv[1:, -1])
+        self.xp.add(uv[1:, -1], u[:-1, 0], out=uv[1:, -1])
 
-        self._num.add(u[0, -1], u[0, 0], out=uv[:1, -1:])
-        self._num.add(uv[0, -1], u[-1, -1], out=uv[:1, -1:])
-        self._num.add(uv[0, -1], u[-1, 0], out=uv[:1, -1:])
+        self.xp.add(u[0, -1], u[0, 0], out=uv[:1, -1:])
+        self.xp.add(uv[0, -1], u[-1, -1], out=uv[:1, -1:])
+        self.xp.add(uv[0, -1], u[-1, 0], out=uv[:1, -1:])
 
-        self._num.multiply(uv, 0.25, out=uv)
+        self.xp.multiply(uv, 0.25, out=uv)
 
     def calc_vu(self, v, vu):
-        self._num.add(v[:-1, 1:], v[1:, 1:], out=vu[:-1, 1:])
-        self._num.add(vu[:-1, 1:], v[:-1, :-1], out=vu[:-1, 1:])
-        self._num.add(vu[:-1, 1:], v[1:, :-1], out=vu[:-1, 1:])
+        self.xp.add(v[:-1, 1:], v[1:, 1:], out=vu[:-1, 1:])
+        self.xp.add(vu[:-1, 1:], v[:-1, :-1], out=vu[:-1, 1:])
+        self.xp.add(vu[:-1, 1:], v[1:, :-1], out=vu[:-1, 1:])
 
-        self._num.add(v[:-1, 0], v[1:, 0], out=vu[:-1, 0])
-        self._num.add(vu[:-1, 0], v[:-1, -1], out=vu[:-1, 0])
-        self._num.add(vu[:-1, 0], v[:-1, -1], out=vu[:-1, 0])
+        self.xp.add(v[:-1, 0], v[1:, 0], out=vu[:-1, 0])
+        self.xp.add(vu[:-1, 0], v[:-1, -1], out=vu[:-1, 0])
+        self.xp.add(vu[:-1, 0], v[:-1, -1], out=vu[:-1, 0])
 
-        self._num.add(v[-1, 0], v[0, 0], out=vu[-1:, :1])
-        self._num.add(vu[-1:, :1], v[-1, -1], out=vu[-1:, :1])
-        self._num.add(vu[-1:, :1], v[0, -1], out=vu[-1:, :1])
+        self.xp.add(v[-1, 0], v[0, 0], out=vu[-1:, :1])
+        self.xp.add(vu[-1:, :1], v[-1, -1], out=vu[-1:, :1])
+        self.xp.add(vu[-1:, :1], v[0, -1], out=vu[-1:, :1])
 
-        self._num.multiply(vu, 0.25, out=vu)
+        self.xp.multiply(vu, 0.25, out=vu)
+    """
