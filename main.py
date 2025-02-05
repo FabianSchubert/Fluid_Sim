@@ -1,16 +1,19 @@
 import numpy as np
 import pygame as pg
 
+import cProfile, pstats, io
+from pstats import SortKey
+
 from simulator import Simulator
 
-WIDTH, HEIGHT = 500, 500
+WIDTH, HEIGHT = 500, 350
 
-SCR_WIDTH, SCR_HEIGHT = 1500, 1500
+SCR_WIDTH, SCR_HEIGHT = 500, 350
 
 STRETCH_WIDTH = SCR_WIDTH / WIDTH
 STRETCH_HEIGHT = SCR_HEIGHT / HEIGHT
 
-sim = Simulator((WIDTH, HEIGHT), backend="GPU", precision="f32")
+sim = Simulator((WIDTH, HEIGHT), backend="GPU")
 
 pg.init()
 
@@ -32,14 +35,18 @@ def hsv_to_rgb(x):
 
 
 def col_map(f, c, gain=1.0):
-    c[..., 0] = (255 * (1.0 - np.exp(-f * gain))).astype(np.uint8).T
+    _gr = (1.0 - np.exp(-f * gain)).T
+
+    c[..., 0] = (255 * _gr * 0.5).astype(
+        np.uint8
+    )  # (255 * (1.0 - np.exp(-f * gain))).astype(np.uint8).T
     # c[..., 0] = (255 * (1.0 + np.tanh(f)) * 0.5).astype(np.uint8).T
-    c[..., 1] = c[..., 0]
-    c[..., 2] = c[..., 0]
+    c[..., 1] = (255 * _gr * 0.75).astype(np.uint8)
+    c[..., 2] = (255 * _gr * 1.0).astype(np.uint8)
 
 
-# pr = cProfile.Profile()
-# pr.enable()
+pr = cProfile.Profile()
+pr.enable()
 
 while running:
 
@@ -99,7 +106,7 @@ while running:
 
     screen.fill((0, 0, 0))
 
-    """
+    # """
     pxarr = pg.surfarray.pixels3d(plot_surf)
 
     u = sim.u
@@ -123,7 +130,7 @@ while running:
             screen,
             (255, 255, 255),
             (pos_part[i, 0] * STRETCH_WIDTH, pos_part[i, 1] * STRETCH_HEIGHT),
-            2,
+            1,
         )
 
     pg.display.flip()
@@ -132,3 +139,10 @@ while running:
 
 
 pg.quit()
+
+pr.disable()
+s = io.StringIO()
+sortby = SortKey.CUMULATIVE
+ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+ps.print_stats()
+print(s.getvalue())
